@@ -1,0 +1,113 @@
+# ============================================
+# SCRIPT: MONITORAMENTO DE SAÚDE DO ROTEADOR (RB4011)
+# AUTOR: Seu Nome
+# DESCRICAO: Monitora temperatura, voltagem, CPU e memória. Envia alertas via Telegram.
+# ============================================
+
+# ============================================
+# CONFIGURAÇÕES (PREENCHA COM SEUS DADOS)
+# ============================================
+
+# Token do Bot do Telegram
+:local telegramToken "SEU_TOKEN_AQUI"
+
+# Chat ID do Telegram
+:local chatId "SEU_CHAT_ID_AQUI"
+
+# Limites Críticos (Ajuste conforme a realidade do seu ambiente)
+:local tempMaxCPU 75       # Temperatura máxima da CPU em °C (ideal < 70) [citation:6]
+:local voltMin 20          # Tensão mínima em Volts (RB4011 aceita 12-57V, mas quedas podem indicar problema) [citation:4]
+:local cpuUsoMax 85        # % máxima de uso da CPU
+:local memoriaMin 50       # % mínima de memória livre (ex: se livre < 50%, alerta)
+
+# ============================================
+# VARIÁVEIS DE ESTADO (NÃO ALTERAR)
+# ============================================
+:global saudeAlertaEnviado
+:if ([:typeof $saudeAlertaEnviado] = "nothing") do={ :set saudeAlertaEnviado false }
+
+# ============================================
+# FUNÇÃO: Enviar mensagem para o Telegram
+# ============================================
+:local enviarTelegram do={
+    :local mensagem $"1"
+    :log info ("Enviando alerta Telegram: " . $mensagem)
+    :local mensagemCodificada [/tool fetch urlencode $mensagem]
+    :local url ("https://api.telegram.org/bot" . $telegramToken . "/sendMessage?chat_id=" . $chatId . "&text=" . $mensagemCodificada)
+    /tool fetch url=$url keep-result=no
+}
+
+# ============================================
+# COLETA DE DADOS DE SAÚDE
+# ============================================
+
+# Obtém a temperatura da CPU (o RB4011 pode usar "cpu-temperature" ou "temperature")
+:local cpuTemp [/system health get cpu-temperature 2>/dev/null]
+:if ([:len $cpuTemp] = 0) do={ :set cpuTemp [/system health get temperature 2>/dev/null] }
+:set cpuTemp [:tonum $cpuTemp]
+
+# Obtém a tensão (voltagem) de entrada
+:local voltagem [:tonum [/system health get voltage 2>/dev/null]]
+
+# Obtém uso de CPU e memória
+:local cpuLoad [:tonum [/system resource get cpu-load]]
+:local memoriaTotal [/system resource get total-memory]
+:local memoriaLivre [/system resource get free-memory]
+:local memoriaLivrePercentual (($memoriaLivre * 100) / $memoriaTotal)
+
+# ============================================
+# VERIFICAÇÃO DE LIMITES CRÍTICOS
+# ============================================
+
+:local problema false
+:local mensagemAlerta "*⚠️ ALERTA DE SAÚDE - RB4011*\n"
+:local mensagemResolvido "*✅ SAÚDE NORMALIZADA - RB4011*\n"
+:local detalhes ""
+
+:if ($cpuTemp > $tempMaxCPU) do={
+    :set problema true
+    :set detales ($detalhes . "❌ Temperatura CPU: $cpuTemp°C (Limite: $tempMaxCPU°C)\n")
+} else={
+    :set detalhes ($detalhes . "✅ Temperatura CPU: $cpuTemp°C\n")
+}
+
+:if ($voltagem < $voltMin) do={
+    :set problema true
+    :set detalhes ($detalhes . "⚠️ Tensão Baixa: $voltagem V (Mín: $voltMin V)\n")
+} else={
+    :set detalhes ($detalhes . "✅ Tensão: $voltagem V\n")
+}
+
+:if ($cpuLoad > $cpuUsoMax) do={
+    :set problema true
+    :set detalhes ($detalhes . "❌ CPU em $cpuLoad% (Limite: $cpuUsoMax%)\n")
+} else={
+    :set detalhes ($detalhes . "✅ CPU: $cpuLoad%\n")
+}
+
+:if ($memoriaLivrePercentual < $memoriaMin) do={
+    :set problema true
+    :set detalhes ($detalhes . "⚠️ Pouca Memória Livre: $memoriaLivrePercentual% (Mín: $memoriaMin%)\n")
+} else={
+    :set detalhes ($detalhes . "✅ Memória Livre: $memoriaLivrePercentual%\n")
+}
+
+# ============================================
+# LÓGICA DE ENVIO DE ALERTAS (Evita spam a cada execução)
+# ============================================
+
+:if ($problema) do={
+    # Se há problema E o alerta ainda não foi enviado nesta "sessão" de problema...
+    :if ($saudeAlertaEnviado = false) do={
+        $enviarTelegram ($mensagemAlerta . $detalhes . "\n🔧 Verifique o roteador.")
+        :set saudeAlertaEnviado true
+    }
+} else={
+    # Se não há problema, MAS o alerta havia sido enviado (estava em estado de erro), envia resolução.
+    :if ($saudeAlertaEnviado = true) do={
+        $enviarTelegram ($mensagemResolvido . $detalhes . "\n🟢 Todos os parâmetros normalizados.")
+        :set saudeAlertaEnviado false
+    }
+}
+
+:log info "Monitoramento de saúde concluído. CPU: $cpuLoad%, Temp: $cpuTemp°C, Mem. Livre: $memoriaLivrePercentual%"

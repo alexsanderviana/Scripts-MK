@@ -1,0 +1,198 @@
+# ============================================
+# SCRIPT: MONITORAMENTO DE LINK DIGITALNET
+# MODELO: MikroTik POP Itajai
+# AUTOR: Alexsander Viana
+# DATA: 2026
+# DESCRICAO: Monitora status de links WAN e envia alertas via Telegram
+# ============================================
+
+# ============================================
+# VARIÁVEIS DE CONFIGURAÇÃO
+# ============================================
+
+# Token do Bot do Telegram (obtido do @BotFather)
+:local telegramToken "SEU_TOKEN_AQUI"
+
+# Chat ID do Telegram (seu ID de usuário)
+:local chatId "SEU_CHAT_ID_AQUI"
+
+# Interface WAN principal (ajuste conforme sua configuração)
+:local wanPrincipal "ether1"
+
+# Interface WAN backup (opcional, remova se não usar)
+:local wanBackup "ether2"
+
+# Tempo em segundos para considerar link down (3 pings falhos = 9 segundos)
+:local tempoTimeout 9
+
+# Intervalo entre verificações em segundos
+:local intervaloVerificacao 60
+
+# ============================================
+# VARIÁVEIS DE ESTADO (NÃO ALTERAR)
+# ============================================
+
+# Armazena estado anterior dos links
+:global linkWanPrincipalStatus
+:global linkWanBackupStatus
+:global ultimaMudanca
+
+# ============================================
+# FUNÇÃO: Enviar mensagem para o Telegram
+# ============================================
+
+:local enviarTelegram do={
+    :local mensagem $"1"
+    :log info ("Enviando alerta Telegram: " . $mensagem)
+    
+    # Codifica a mensagem para URL (remove espaços e caracteres especiais)
+    :local mensagemCodificada [/tool fetch urlencode $mensagem]
+    
+    # Monta a URL da API do Telegram
+    :local url ("https://api.telegram.org/bot" . $telegramToken . "/sendMessage?chat_id=" . $chatId . "&text=" . $mensagemCodificada)
+    
+    # Envia a mensagem via fetch (sem verificação SSL)
+    /tool fetch url=$url keep-result=no
+}
+
+# ============================================
+# FUNÇÃO: Verificar status do link
+# ============================================
+
+:local verificarLink do={
+    :local interface $"1"
+    :local nomeInterface $"2"
+    
+    # Tenta pingar 3 vezes um IP confiável (8.8.8.8 - Google DNS)
+    :local resultado [/ping 8.8.8.8 count=3 interval=1 interface=$interface]
+    
+    # Verifica se todos os pings foram bem sucedidos
+    :if ($resultado = 3) do={
+        # Link está funcionando
+        :return "up"
+    } else={
+        # Link está com problema
+        :return "down"
+    }
+}
+
+# ============================================
+# INÍCIO DO SCRIPT PRINCIPAL
+# ============================================
+
+:log info "Iniciando monitoramento de links..."
+
+# Obtém status atual dos links
+:local statusWanPrincipal [$verificarLink $wanPrincipal "WAN Principal"]
+:local statusWanBackup [$verificarLink $wanBackup "WAN Backup"]
+
+# ============================================
+# VERIFICAÇÃO WAN PRINCIPAL
+# ============================================
+
+# Se é a primeira execução, apenas define o estado inicial
+:if ([:typeof $linkWanPrincipalStatus] = "nothing") do={
+    :set linkWanPrincipalStatus $statusWanPrincipal
+    :set ultimaMudanca ([/system clock get date] . " " . [/system clock get time])
+    :log info ("Estado inicial WAN Principal: " . $statusWanPrincipal)
+} else={
+    # Verifica se houve mudança de estado
+    :if ($linkWanPrincipalStatus != $statusWanPrincipal) do={
+        # Atualiza o estado
+        :set linkWanPrincipalStatus $statusWanPrincipal
+        :set ultimaMudanca ([/system clock get date] . " " . [/system clock get time])
+        
+        # Prepara mensagem de alerta
+        :local mensagem ("*🔔 ALERTA DE LINK - POP-CLARO*\n" . \
+                        "📡 Interface: WAN Principal ($wanPrincipal)\n" . \
+                        "🕒 Data/Hora: " . $ultimaMudanca . "\n")
+        
+        # Adiciona status à mensagem
+        :if ($statusWanPrincipal = "up") do={
+            :set mensagem ($mensagem . "✅ Status: Link RESTABELECIDO\n" . \
+                          "🟢 Conectividade normal retomada")
+        } else={
+            :set mensagem ($mensagem . "❌ Status: Link CAIU\n" . \
+                          "🔴 Conexão perdida - Verifique!")
+        }
+        
+        # Envia alerta
+        [$enviarTelegram $mensagem]
+        
+        # Log local
+        :log warning ("Mudança detectada WAN Principal: " . $statusWanPrincipal)
+    }
+}
+
+# ============================================
+# VERIFICAÇÃO WAN BACKUP (se configurada)
+# ============================================
+
+:if ($wanBackup != "") do={
+    # Se é a primeira execução, apenas define o estado inicial
+    :if ([:typeof $linkWanBackupStatus] = "nothing") do={
+        :set linkWanBackupStatus $statusWanBackup
+        :log info ("Estado inicial WAN Backup: " . $statusWanBackup)
+    } else={
+        # Verifica se houve mudança de estado
+        :if ($linkWanBackupStatus != $statusWanBackup) do={
+            # Atualiza o estado
+            :set linkWanBackupStatus $statusWanBackup
+            :set ultimaMudanca ([/system clock get date] . " " . [/system clock get time])
+            
+            # Prepara mensagem de alerta
+            :local mensagem ("*🔔 ALERTA DE LINK - POP-CLARO*\n" . \
+                            "📡 Interface: WAN Backup ($wanBackup)\n" . \
+                            "🕒 Data/Hora: " . $ultimaMudanca . "\n")
+            
+            # Adiciona status à mensagem
+            :if ($statusWanBackup = "up") do={
+                :set mensagem ($mensagem . "✅ Status: Link RESTABELECIDO\n" . \
+                              "🟢 Conectividade normal retomada")
+            } else={
+                :set mensagem ($mensagem . "❌ Status: Link CAIU\n" . \
+                              "🔴 Conexão perdida - Verifique!")
+            }
+            
+            # Envia alerta
+            [$enviarTelegram $mensagem]
+            
+            # Log local
+            :log warning ("Mudança detectada WAN Backup: " . $statusWanBackup)
+        }
+    }
+}
+
+# ============================================
+# RESUMO DE STATUS (opcional - executa a cada 1 hora)
+# ============================================
+
+:local minutoAtual [:pick [/system clock get time] 3 5]
+:if ($minutoAtual = "00") do={
+    :local mensagemResumo ("*📊 RESUMO DE STATUS - POP-CLARO*\n" . \
+                          "🕒 " . ([/system clock get date] . " " . [/system clock get time]) . "\n" . \
+                          "═══════════════════════\n" . \
+                          "📡 WAN Principal ($wanPrincipal): ")
+    
+    :if ($linkWanPrincipalStatus = "up") do={
+        :set mensagemResumo ($mensagemResumo . "✅ ATIVO\n")
+    } else={
+        :set mensagemResumo ($mensagemResumo . "❌ INATIVO\n")
+    }
+    
+    :if ($wanBackup != "") do={
+        :set mensagemResumo ($mensagemResumo . "📡 WAN Backup ($wanBackup): ")
+        :if ($linkWanBackupStatus = "up") do={
+            :set mensagemResumo ($mensagemResumo . "✅ ATIVO\n")
+        } else={
+            :set mensagemResumo ($mensagemResumo . "❌ INATIVO\n")
+        }
+    }
+    
+    :set mensagemResumo ($mensagemResumo . "═══════════════════════\n" . \
+                        "🔄 Última mudança: " . $ultimaMudanca)
+    
+    [$enviarTelegram $mensagemResumo]
+}
+
+:log info "Monitoramento concluído. Aguardando próximo ciclo..."

@@ -1,0 +1,136 @@
+# ============================================
+# SCRIPT: QoS AUTOMÁTICO POR DETECÇÃO DE CARGA (RB4011)
+# AUTOR: Seu Nome
+# DESCRICAO: Monitora tráfego e limita IPs específicos se consumirem banda excessiva.
+# ============================================
+
+# ============================================
+# CONFIGURAÇÕES
+# ============================================
+:local telegramToken "SEU_TOKEN_AQUI"
+:local chatId "SEU_CHAT_ID_AQUI"
+
+# Interfaces
+:local interfaceWAN "ether1"          # Interface de saída para a internet
+:local interfaceLAN "bridge"           # Interface da rede local
+
+# Limiares de tráfego (em bits/segundo)
+:local limiteDownload 30000000         # 30 Mbps - Se um IP passar disso, será limitado
+:local limiteUpload 5000000             # 5 Mbps
+:local limiteReduzidoDownload 10000000  # 10 Mbps - Banda que o IP limitado terá
+:local limiteReduzidoUpload 2000000      # 2 Mbps
+
+# Lista de IPs que NUNCA devem ser limitados (ex: servidor, seu IP)
+:local listaBypass {"192.168.88.10"; "192.168.88.254"}
+
+# ============================================
+# FUNÇÃO: Enviar Telegram (reutilizada)
+# ============================================
+:local enviarTelegram do={
+    :local mensagem $"1"
+    :log info ("Enviando alerta Telegram: " . $mensagem)
+    :local mensagemCodificada [/tool fetch urlencode $mensagem]
+    :local url ("https://api.telegram.org/bot" . $telegramToken . "/sendMessage?chat_id=" . $chatId . "&text=" . $mensagemCodificada)
+    /tool fetch url=$url keep-result=no
+}
+
+# ============================================
+# FUNÇÃO: Verificar se IP está na lista de bypass
+# ============================================
+:local isBypass do={
+    :local ipVerificar $"1"
+    :local resultado false
+    :foreach ip in=$listaBypass do={
+        :if ($ip = $ipVerificar) do={ :set resultado true }
+    }
+    :return $resultado
+}
+
+# ============================================
+# VERIFICAÇÃO DE TRÁFEGO COM O TORCH
+# ============================================
+# O Torch é uma ferramenta de diagnóstico em tempo real. Vamos executá-lo por alguns segundos
+# para capturar os "maiores consumidores".
+
+# Limpa resultados anteriores de firewall (se houver marcações antigas)
+/ip firewall mangle remove [find comment="AutoQoS_Temp"]
+
+# Inicia uma captura Torch rápida (5 segundos) na interface LAN, monitorando tráfego de download/upload.
+:local usuarios []
+:local dados [/tool torch interface=$interfaceLAN port=any duration=5 src-address=0.0.0.0/0 dst-address=0.0.0.0/0]
+
+# Processa a saída do Torch (esta é uma simulação, pois o Torch não retorna dados diretamente para script facilmente.
+# Na prática, usaremos as estatísticas de conexão do firewall para uma solução mais robusta.
+# Vamos usar as conexões ativas como proxy de consumo.
+
+# Estratégia alternativa: Usar /ip firewall connection print para encontrar IPs com muitas conexões ou tráfego.
+
+:local conexoes [/ip firewall connection find where protocol=TCP or protocol=UDP]
+
+# Zera contadores para análise
+:local consumoIP [:toarray ""]
+
+# Itera sobre as conexões para somar bytes enviados/recebidos por IP (simulação de alta carga)
+:foreach conn in=$conexoes do={
+    :local src [/ip firewall connection get $conn src-address]
+    :local dst [/ip firewall connection get $conn dst-address]
+    :local srcIP [:pick $src 0 [:find $src ":"]]
+    :local dstIP [:pick $dst 0 [:find $dst ":"]]
+    :local bytesOut [/ip firewall connection get $conn orig-bytes]  # Bytes enviados pela origem
+    :local bytesIn [/ip firewall connection get $conn reply-bytes]  # Bytes recebidos pela origem
+
+    # Para simplificar, vamos focar nos IPs de origem da rede local (LAN)
+    :if ([/ip route find where dst-address=$srcIP gateway=0.0.0.0] = "") do={
+        # Se o srcIP não é uma rota de internet, provavelmente é um IP local
+        :if ( ($srcIP != "0.0.0.0") and ([:typeof $consumoIP->$srcIP] = "nothing") ) do={
+            :set ($consumoIP->$srcIP) 0
+        }
+        :set ($consumoIP->$srcIP) ( ($consumoIP->$srcIP) + $bytesOut + $bytesIn )
+    }
+}
+
+# ============================================
+# APLICAÇÃO DA REGRA DE LIMITAÇÃO (SIMPLE QUEUE DINÂMICA)
+# ============================================
+
+:local mensagemQoS ""
+
+# Para cada IP local com alto consumo...
+:foreach ip,consumo in=$consumoIP do={
+    :if ( ( (($consumo / 5) > $limiteUpload) or (($consumo / 5) > $limiteDownload) ) and ( [$isBypass $ip] = false ) ) do={
+        # Se o consumo médio por segundo nos últimos 5 segundos for maior que os limites, aplica a queue.
+
+        :local queueExistente [/queue simple find where name="QoS-Limit-$ip"]
+        :if ([:len $queueExistente] = 0) do={
+            # Cria uma fila simples para limitar o IP
+            /queue simple add name="QoS-Limit-$ip" dst=$ip/32 max-limit=$limiteReduzidoUpload/$limiteReduzidoDownload comment="AutoQoS_Temp"
+            :set mensagemQoS ($mensagemQoS . "🚫 IP $ip limitado (consumo alto).\n")
+            :log warning ("AutoQoS: IP $ip limitado por alto consumo.")
+        }
+    } else={
+        # Se o consumo normalizou, remove a queue se ela existir
+        :local queueExistente [/queue simple find where name="QoS-Limit-$ip"]
+        :if ([:len $queueExistente] > 0) do={
+            /queue simple remove $queueExistente
+            :set mensagemQoS ($mensagemQoS . "✅ IP $ip liberado (consumo normalizou).\n")
+            :log info ("AutoQoS: IP $ip liberado.")
+        }
+    }
+}
+
+# Remove queues para IPs que não existem mais nas conexões (otimização)
+:foreach queue in=[/queue simple find where comment="AutoQoS_Temp"] do={
+    :local nomeQueue [/queue simple get $queue name]
+    :local ipQueue [:pick $nomeQueue 11 [:len $nomeQueue]]  # Extrai o IP do nome "QoS-Limit-192.168.88.X"
+    :if ([:typeof $consumoIP->$ipQueue] = "nothing") do={
+        /queue simple remove $queue
+        :log info ("AutoQoS: Removida queue para IP inativo $ipQueue.")
+    }
+}
+
+# ============================================
+# ALERTA VIA TELEGRAM (se houver mudanças)
+# ============================================
+:if ([:len $mensagemQoS] > 0) do={
+    $enviarTelegram ("*⚙️ AÇÃO DE QoS AUTOMÁTICO*\n" . $mensagemQoS)
+}

@@ -1,0 +1,97 @@
+# ============================================
+# SCRIPT: MONITORAMENTO AVANÇADO DE TRÁFEGO E CLIENTES (RB4011)
+# AUTOR: Seu Nome
+# DESCRICAO: Gera um relatório periódico com lista de clientes ativos e consumo.
+# ============================================
+
+# ============================================
+# CONFIGURAÇÕES
+# ============================================
+:local telegramToken "SEU_TOKEN_AQUI"
+:local chatId "SEU_CHAT_ID_AQUI"
+:local interfaceLAN "bridge"            # Interface da LAN (para contagem de clientes)
+
+# ============================================
+# FUNÇÃO: Enviar Telegram
+# ============================================
+:local enviarTelegram do={
+    :local mensagem $"1"
+    :local mensagemCodificada [/tool fetch urlencode $mensagem]
+    :local url ("https://api.telegram.org/bot" . $telegramToken . "/sendMessage?chat_id=" . $chatId . "&text=" . $mensagemCodificada)
+    /tool fetch url=$url keep-result=no
+}
+
+# ============================================
+# COLETA DE DADOS DOS CLIENTES (DHCP e ARP)
+# ============================================
+
+:local clientesLista ""
+:local totalClientes 0
+
+# Obtém a lista de leases do DHCP server (clientes que receberam IP)
+:local dhcpLeases [/ip dhcp-server lease find where status=bound]
+:set totalClientes [:len $dhcpLeases]
+
+:foreach lease in=$dhcpLeases do={
+    :local hostName [/ip dhcp-server lease get $lease host-name]
+    :local address [/ip dhcp-server lease get $lease address]
+    :local macAddress [/ip dhcp-server lease get $lease mac-address]
+
+    :if ([:len $hostName] = 0) do={ :set hostName "N/A" }
+
+    # Tenta descobrir o tráfego aproximado do cliente via simple queue (se houver)
+    :local tx "0"
+    :local rx "0"
+    :local queueStats [/queue simple find where dst=$address/32]
+    :if ([:len $queueStats] > 0) do={
+        :set tx [/queue simple get $queueStats bytes]
+        :set rx [/queue simple get $queueStats packets] # Exemplo simplificado
+    }
+
+    :set clientesLista ($clientesLista . "👤 $hostName ($address) - MAC: $macAddress\n")
+}
+
+# ============================================
+# COLETA DE ESTATÍSTICAS GLOBAIS DE TRÁFEGO
+# ============================================
+
+# Uso de CPU e memória (reaproveitando do script de saúde)
+:local cpuLoad [:tonum [/system resource get cpu-load]]
+:local memoriaTotal [/system resource get total-memory]
+:local memoriaLivre [/system resource get free-memory]
+:local memoriaUsada ( (($memoriaTotal - $memoriaLivre) * 100) / $memoriaTotal )
+
+# Tráfego nas interfaces WAN nos últimos 60 segundos
+:local rxWAN [/interface get $interfaceWAN rx-byte]
+:local txWAN [/interface get $interfaceWAN tx-byte]
+:local rxWANAnterior $rxWAN
+:global rxWANHistorico
+:if ([:typeof $rxWANHistorico] = "nothing") do={ :set rxWANHistorico $rxWAN }
+
+:local rxWANRate (($rxWAN - $rxWANHistorico) * 8)  # Taxa em bits/s (aproximada)
+:local txWANRate (($txWAN - [:global txWANHistorico 0]) * 8)
+
+:set rxWANHistorico $rxWAN
+
+# ============================================
+# MONTAGEM DA MENSAGEM DE RESUMO
+# ============================================
+
+:local dataHora [/system clock get date] . " " . [/system clock get time]
+:local mensagem ("*📊 RESUMO DA REDE - RB4011*\n")
+:set mensagem ($mensagem . "🕒 $dataHora\n")
+:set mensagem ($mensagem . "═══════════════════════\n")
+:set mensagem ($mensagem . "*📡 CLIENTES ATIVOS:* $totalClientes\n")
+:set mensagem ($mensagem . "$clientesLista\n")
+:set mensagem ($mensagem . "═══════════════════════\n")
+:set mensagem ($mensagem . "*🖥️ ESTADO DO ROTEADOR*\n")
+:set mensagem ($mensagem . "🔧 CPU: $cpuLoad% | RAM Usada: $memoriaUsada%\n")
+:set mensagem ($mensagem . "⬇️ Download (WAN): $rxWANRate bps\n")
+:set mensagem ($mensagem . "⬆️ Upload (WAN): $txWANRate bps\n")
+
+# ============================================
+# ENVIO DO RESUMO
+# ============================================
+
+$enviarTelegram $mensagem
+:log info "Resumo de rede enviado. Clientes ativos: $totalClientes."
